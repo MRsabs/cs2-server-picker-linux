@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Deno](https://img.shields.io/badge/deno-v1.x-blue.svg)](https://deno.land/)
-[![GitHub release](https://img.shields.io/github/v/release/YOUR_USERNAME/cs2-server-picker-linux)](https://github.com/YOUR_USERNAME/cs2-server-picker-linux/releases)
+[![GitHub release](https://img.shields.io/github/v/release/MRsabs/cs2-server-picker-linux)](https://github.com/MRsabs/cs2-server-picker-linux/releases)
 
 Block high-ping CS2 servers by location using kernel-level IP route blackholes.
 
@@ -21,7 +21,7 @@ Block high-ping CS2 servers by location using kernel-level IP route blackholes.
 
 ## Installation
 
-Download from [releases](https://github.com/YOUR_USERNAME/cs2-server-picker-linux/releases):
+Download from [releases](https://github.com/MRsabs/cs2-server-picker-linux/releases):
 
 ```bash
 chmod +x cs2-server-picker-linux
@@ -32,7 +32,7 @@ Or build from source:
 
 ```bash
 curl -fsSL https://deno.land/install.sh | sh
-git clone https://github.com/YOUR_USERNAME/cs2-server-picker-linux.git
+git clone https://github.com/MRsabs/cs2-server-picker-linux.git
 cd cs2-server-picker-linux
 deno task build
 sudo ./cs2-server-picker
