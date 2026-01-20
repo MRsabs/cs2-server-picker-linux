@@ -1,0 +1,32 @@
+# Compiled executables
+cs2-server-picker
+cs2-server-picker-linux
+cs2-blocker
+cs2-blocker-*
+*.exe
+
+# Temporary files
+/tmp/
+*.tmp
+cs2_relays.json
+
+# Deno
+.deno/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# State files (for development)
+/var/lib/cs2-blocker/
+
+# Release archives
+*.tar.gz
+*.zip

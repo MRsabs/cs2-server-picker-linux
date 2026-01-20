@@ -1,0 +1,10 @@
+{
+  "name": "cs2-server-picker-linux",
+  "version": "1.0.0",
+  "description": "Block CS2 relay servers by location to control matchmaking",
+  "tasks": {
+    "build": "deno compile --allow-net --allow-run --allow-read --allow-write --allow-sys --output cs2-server-picker main.ts",
+    "build-linux": "deno compile --allow-net --allow-run --allow-read --allow-write --allow-sys --target x86_64-unknown-linux-gnu --output cs2-server-picker-linux main.ts",
+    "build-all": "deno task build-linux"
+  }
+}

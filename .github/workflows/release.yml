@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+      
+      - name: Get version
+        id: version
+        run: echo "VERSION=$(deno eval 'console.log(Deno.readTextFileSync("deno.json") |> JSON.parse(_).version)')" >> $GITHUB_OUTPUT
+      
+      - name: Build executable
+        run: deno task build-linux
+      
+      - name: Prepare executable
+        run: |
+          mv cs2-server-picker-linux cs2-server-picker-linux
+          chmod +x cs2-server-picker-linux
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: cs2-server-picker-linux
+          name: CS2 Server Picker ${{ github.ref_name }}
+          body: |
+            ## CS2 Server Picker ${{ github.ref_name }}
+            
+            Block CS2 relay servers by location to control your matchmaking experience.
+            
+            ### Installation
+            
+            1. Download `cs2-server-picker-linux`
+            2. Make executable: `chmod +x cs2-server-picker-linux`
+            3. Run: `sudo ./cs2-server-picker-linux`
+            
+            Or simply download and double-click to run (will open terminal automatically).
+            
+            ### Features
+            - Block CS2 relay servers by location
+            - Ping test all locations
+            - Interactive menu interface
+            - Double-click support (opens terminal automatically)
+            - Persistent blocking across reboots
+            
+            ### Requirements
+            - Linux (x86_64)
+            - sudo/root access
+            
+            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
