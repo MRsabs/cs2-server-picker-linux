@@ -23,15 +23,13 @@ jobs:
       
       - name: Get version
         id: version
-        run: echo "VERSION=$(deno eval 'console.log(Deno.readTextFileSync("deno.json") |> JSON.parse(_).version)')" >> $GITHUB_OUTPUT
+        run: echo "VERSION=$(deno eval 'const data = JSON.parse(Deno.readTextFileSync("deno.json")); console.log(data.version)')" >> $GITHUB_OUTPUT
       
       - name: Build executable
         run: deno task build-linux
       
       - name: Prepare executable
-        run: |
-          mv cs2-server-picker-linux cs2-server-picker-linux
-          chmod +x cs2-server-picker-linux
+        run: chmod +x cs2-server-picker-linux
       
       - name: Create Release
         uses: softprops/action-gh-release@v1
