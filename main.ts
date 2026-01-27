@@ -1,796 +1,405 @@
-#!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-write=/tmp
+#!/usr/bin/env -S deno run --allow-net --allow-run --allow-read --allow-write=/var/lib/cs2-blocker
 
-/**
- * CS2 Server Picker
- * Block CS2 relay servers by location to control matchmaking
- * Run with sudo privileges
- */
+// Simplified CS2 Server Picker - minimal, inline style
+// Features: fetch relays, parse IPv4, ping, block/unblock (kernel blackhole), state file-based unblock-all
 
-// Auto-launch in terminal if double-clicked
-async function ensureTerminal() {
-  // Check if running in terminal
-  if (!Deno.stdin.isTerminal()) {
-    const execPath = Deno.execPath();
-    
-    // Try different terminal emulators
-    const terminals = [
-      ['gnome-terminal', '--', 'bash', '-c', `sudo '${execPath}'; echo ''; echo 'Press Enter to exit...'; read`],
-      ['konsole', '-e', 'bash', '-c', `sudo '${execPath}'; echo ''; echo 'Press Enter to exit...'; read`],
-      ['xfce4-terminal', '-e', `bash -c "sudo '${execPath}'; echo ''; echo 'Press Enter to exit...'; read"`],
-      ['xterm', '-e', `bash -c "sudo '${execPath}'; echo ''; echo 'Press Enter to exit...'; read"`],
-    ];
-    
-    for (const [cmd, ...args] of terminals) {
-      try {
-        const process = new Deno.Command(cmd, { args });
-        await process.spawn();
-        Deno.exit(0);
-      } catch {
-        // Try next terminal
-      }
-    }
-    
-    // No terminal found, exit
-    console.error('No terminal emulator found. Please run from terminal with: sudo ' + execPath);
+const API_URL = "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730";
+const TEMP_JSON = "/tmp/cs2_relays.json";
+const STATE_DIR = "/var/lib/cs2-blocker";
+const STATE_FILE = `${STATE_DIR}/blocked_ips.txt`;
+
+const colors = {
+  RED: "\x1b[0;31m",
+  GREEN: "\x1b[0;32m",
+  YELLOW: "\x1b[1;33m",
+  CYAN: "\x1b[0;36m",
+  NC: "\x1b[0m",
+};
+
+function print(msg: string) {
+  console.log(msg);
+}
+function info(msg: string) {
+  console.log(`${colors.YELLOW}[INFO]${colors.NC} ${msg}`);
+}
+function success(msg: string) {
+  console.log(`${colors.GREEN}[OK]${colors.NC} ${msg}`);
+}
+function error(msg: string) {
+  console.log(`${colors.RED}[ERR]${colors.NC} ${msg}`);
+}
+
+function isValidIP(ip: string) {
+  return /^(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)$/.test(ip);
+}
+
+function isPrivateIP(ip: string) {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4) return false;
+  if (p[0] === 127) return true;
+  if (p[0] === 10) return true;
+  if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true;
+  if (p[0] === 192 && p[1] === 168) return true;
+  if (p[0] === 169 && p[1] === 254) return true;
+  return false;
+}
+
+async function ensureStateDir() {
+  try {
+    await Deno.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
+  } catch {}
+}
+
+async function readState(): Promise<string[]> {
+  try {
+    const txt = await Deno.readTextFile(STATE_FILE);
+    return txt.split("\n").map((s) => s.trim()).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+async function writeState(ips: string[]) {
+  await ensureStateDir();
+  await Deno.writeTextFile(STATE_FILE, ips.join("\n") + (ips.length ? "\n" : ""), { mode: 0o600 });
+}
+
+async function addState(ip: string) {
+  const ips = await readState();
+  if (!ips.includes(ip)) {
+    ips.push(ip);
+    await writeState(ips);
+  }
+}
+
+async function removeState(ip: string) {
+  const ips = (await readState()).filter((i) => i !== ip);
+  await writeState(ips);
+}
+
+async function fetchRelays() {
+  info("Fetching relay list...");
+  try {
+    const res = await fetch(API_URL);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const txt = await res.text();
+    await Deno.writeTextFile(TEMP_JSON, txt);
+    success("Relay data fetched");
+  } catch (e) {
+    error(`Failed fetch: ${e}`);
     Deno.exit(1);
   }
 }
 
-await ensureTerminal();
-
-// Colors for output
-const colors = {
-  RED: '\x1b[0;31m',
-  GREEN: '\x1b[0;32m',
-  YELLOW: '\x1b[1;33m',
-  BLUE: '\x1b[0;34m',
-  CYAN: '\x1b[0;36m',
-  NC: '\x1b[0m', // No Color
-};
-
-// API URL
-const API_URL = 'https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730';
-
-// Temporary files
-const TEMP_JSON = '/tmp/cs2_relays.json';
-const STATE_DIR = '/var/lib/cs2-blocker';
-const STATE_FILE = `${STATE_DIR}/blocked_ips.txt`;
-
-// Configuration
-// Routes are managed using 'ip route' blackhole entries
-
-// Ensure state directory exists
-async function ensureStateDir() {
+function parseRelays(): Map<string, { name: string; ips: string[] }> {
+  const map = new Map<string, { name: string; ips: string[] }>();
   try {
-    await Deno.mkdir(STATE_DIR, { recursive: true, mode: 0o700 });
+    const txt = Deno.readTextFileSync(TEMP_JSON);
+    const data = JSON.parse(txt);
+    if (!data.pops) return map;
+    for (const [code, pop] of Object.entries(data.pops)) {
+      const popRec = pop as Record<string, unknown>;
+      const relays = popRec.relays as unknown;
+      if (!Array.isArray(relays)) continue;
+      const ips: string[] = [];
+      const name = typeof popRec.desc === "string" ? popRec.desc : (typeof popRec.name === "string" ? popRec.name : "");
+      for (const r of relays as Array<unknown>) {
+        if (!r || typeof r !== "object") continue;
+        const rRec = r as Record<string, unknown>;
+        const ipv4 = typeof rRec.ipv4 === "string" ? (rRec.ipv4 as string) : undefined;
+        if (ipv4 && isValidIP(ipv4) && !isPrivateIP(ipv4)) ips.push(ipv4);
+      }
+      if (ips.length) map.set(String(code), { name, ips });
+    }
   } catch {
-    // Directory already exists or error - ignore
+    // ignore
+  }
+  return map;
+}
+
+async function ping(ip: string): Promise<number | null> {
+  try {
+    const cmd = new Deno.Command("ping", { args: ["-c", "5", "-W", "1", ip], stdout: "piped", stderr: "piped" });
+    const { stdout } = await cmd.output();
+    const out = new TextDecoder().decode(stdout);
+    const m = out.match(/avg[^=]*=\s*[\d.]+\/(\d+\.\d+)/) || out.match(/= [\d.]+\/(\d+\.\d+)\//);
+    if (m) return Math.round(parseFloat(m[1]));
+    return null;
+  } catch {
+    return null;
   }
 }
 
-// Validate IP address format
-function isValidIP(ip: string): boolean {
-  const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
-  return ipv4Regex.test(ip);
+async function pingAll(locMap: Map<string, { name: string; ips: string[] }>) {
+  info("Pinging first IP of each location...");
+  const results = new Map<string, string>();
+  await Promise.all(
+    Array.from(locMap.entries()).map(async ([code, obj]) => {
+      const first = obj.ips[0];
+      const p = await ping(first);
+      results.set(code, p === null ? "TIMEOUT" : `${p}ms`);
+    }),
+  );
+  return results;
 }
 
-// Check if IP is private/localhost to prevent blocking critical addresses
-function isPrivateIP(ip: string): boolean {
-  const parts = ip.split('.').map(Number);
-  if (parts.length !== 4) return false;
-  
-  // Localhost
-  if (parts[0] === 127) return true;
-  // Private ranges
-  if (parts[0] === 10) return true;
-  if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-  if (parts[0] === 192 && parts[1] === 168) return true;
-  // Link local
-  if (parts[0] === 169 && parts[1] === 254) return true;
-  
-  return false;
+function showTable(locMap: Map<string, { name: string; ips: string[] }>, pings: Map<string, string>, blocked: Map<string, string>) {
+  // Sort entries by ping (lowest to highest)
+  const entries = Array.from(locMap.entries()).sort(([codeA], [codeB]) => {
+    const pingA = pings.get(codeA) || "N/A";
+    const pingB = pings.get(codeB) || "N/A";
+    const numA = pingA === "TIMEOUT" ? Infinity : pingA === "N/A" ? Infinity : parseInt(pingA);
+    const numB = pingB === "TIMEOUT" ? Infinity : pingB === "N/A" ? Infinity : parseInt(pingB);
+    return numA - numB;
+  });
+
+  const rows = entries.map(([code, obj]) => {
+    const ping = pings.get(code) || "N/A";
+    const status = blocked.get(code) || "UNKN";
+    const label = obj.name || "";
+    return {
+      Code: code,
+      Label: label,
+      Ping: ping,
+      Status: status,
+    };
+  });
+
+  console.table(rows);
 }
 
-// State file management
-async function addToStateFile(ip: string) {
+async function isBlockedIp(ip: string) {
   try {
-    await ensureStateDir();
-    
-    let ips: string[] = [];
-    try {
-      const content = await Deno.readTextFile(STATE_FILE);
-      ips = content.split('\n').filter(line => line.trim());
-    } catch {
-      // File doesn't exist yet
-    }
-    
-    if (!ips.includes(ip)) {
-      ips.push(ip);
-      await Deno.writeTextFile(STATE_FILE, ips.join('\n') + '\n', { mode: 0o600 });
-    }
-  } catch (error) {
-    printError(`Failed to update state file: ${error}`);
-  }
-}
-
-async function removeFromStateFile(ip: string) {
-  try {
-    let ips: string[] = [];
-    try {
-      const content = await Deno.readTextFile(STATE_FILE);
-      ips = content.split('\n').filter(line => line.trim());
-    } catch {
-      return;
-    }
-    
-    ips = ips.filter(i => i !== ip);
-    await Deno.writeTextFile(STATE_FILE, ips.join('\n') + '\n');
-  } catch (error) {
-    printError(`Failed to update state file: ${error}`);
-  }
-}
-
-async function isInStateFile(ip: string): Promise<boolean> {
-  try {
-    const content = await Deno.readTextFile(STATE_FILE);
-    const ips = content.split('\n').filter(line => line.trim());
-    return ips.includes(ip);
+    const cmd = new Deno.Command("ip", { args: ["route", "show", ip], stdout: "piped", stderr: "piped" });
+    const { stdout } = await cmd.output();
+    const out = new TextDecoder().decode(stdout);
+    return out.includes("blackhole");
   } catch {
     return false;
   }
 }
 
-// Location data storage
-interface LocationData {
-  names: Map<string, string>;
-  ips: Map<string, string[]>;
-  pings: Map<string, string>;
-  blocked: Map<string, string>;
-}
-
-const locationData: LocationData = {
-  names: new Map(),
-  ips: new Map(),
-  pings: new Map(),
-  blocked: new Map(),
-};
-
-// Helper functions
-function printHeader() {
-  console.log(`${colors.BLUE}`);
-  console.log('=========================================');
-  console.log('    CS2 Server Picker v1.0.0');
-  console.log('=========================================');
-  console.log(`${colors.NC}`);
-}
-
-function printError(msg: string) {
-  console.log(`${colors.RED}[ERROR]${colors.NC} ${msg}`);
-}
-
-function printSuccess(msg: string) {
-  console.log(`${colors.GREEN}[SUCCESS]${colors.NC} ${msg}`);
-}
-
-function printInfo(msg: string) {
-  console.log(`${colors.YELLOW}[INFO]${colors.NC} ${msg}`);
-}
-
-async function checkDependencies() {
-  const commands = ['iptables', 'ip6tables', 'ping'];
-  const missing: string[] = [];
-
-  for (const cmd of commands) {
-    try {
-      const process = new Deno.Command('which', { args: [cmd] });
-      const { code } = await process.output();
-      if (code !== 0) {
-        missing.push(cmd);
-      }
-    } catch {
-      missing.push(cmd);
-    }
-  }
-
-  if (missing.length > 0) {
-    printError('Missing dependencies:');
-    for (const dep of missing) {
-      console.log(`  - ${dep}`);
-    }
-    console.log('\nPlease install missing packages:');
-    console.log('  Ubuntu/Debian: sudo apt-get install iptables iputils-ping');
-    console.log('  RHEL/CentOS: sudo yum install iptables iputils');
-    Deno.exit(1);
-  }
-}
-
-function checkRoot() {
-  if (Deno.uid() !== 0) {
-    printError('Please run as root or with sudo');
-    Deno.exit(1);
-  }
-}
-
-async function fetchRelays() {
-  printInfo('Fetching CS2 relay information from Steam API...');
-
+async function blockIp(ip: string) {
   try {
-    const response = await fetch(API_URL);
-    if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
-    }
-    const data = await response.text();
-    await Deno.writeTextFile(TEMP_JSON, data);
-    
-    // Validate JSON
-    JSON.parse(data);
-    
-    printSuccess('API data fetched successfully');
-  } catch (error) {
-    printError(`Failed to fetch data from Steam API: ${error}`);
-    Deno.exit(1);
-  }
-}
-
-async function parseLocations() {
-  printInfo('Parsing relay locations...');
-
-  try {
-    const jsonText = await Deno.readTextFile(TEMP_JSON);
-    const data = JSON.parse(jsonText);
-
-    if (!data.pops) {
-      printError('No relay locations found');
-      Deno.exit(1);
-    }
-
-    for (const [popCode, popData] of Object.entries(data.pops as Record<string, any>)) {
-      const locationDesc = popData.desc;
-      const ipv4List: string[] = [];
-
-      if (popData.relays && Array.isArray(popData.relays)) {
-        for (const relay of popData.relays) {
-          if (relay.ipv4) {
-            const ip = relay.ipv4;
-            // Validate IP format and ensure it's not private/localhost
-            if (isValidIP(ip) && !isPrivateIP(ip)) {
-              ipv4List.push(ip);
-            } else if (isPrivateIP(ip)) {
-              printError(`Skipping private/localhost IP: ${ip}`);
-            }
-          }
-        }
-      }
-
-      if (ipv4List.length > 0) {
-        locationData.names.set(popCode, locationDesc);
-        locationData.ips.set(popCode, ipv4List);
-      }
-    }
-
-    printSuccess(`Found ${locationData.names.size} relay locations`);
-  } catch (error) {
-    printError(`Failed to parse locations: ${error}`);
-    Deno.exit(1);
-  }
-}
-
-async function pingLocation(popCode: string) {
-  const ips = locationData.ips.get(popCode);
-  if (!ips || ips.length === 0) {
-    locationData.pings.set(popCode, 'N/A');
-    return;
-  }
-
-  const firstIp = ips[0];
-
-  try {
-    const command = new Deno.Command('ping', {
-      args: ['-c', '2', '-W', '1', firstIp],
-      stdout: 'piped',
-      stderr: 'piped',
-    });
-
-    const { stdout } = await command.output();
-    const output = new TextDecoder().decode(stdout);
-    
-    const match = output.match(/avg[^=]*=\s*[\d.]+\/([\d.]+)/);
-    if (match) {
-      const pingValue = Math.round(parseFloat(match[1]));
-      locationData.pings.set(popCode, `${pingValue}ms`);
-    } else {
-      locationData.pings.set(popCode, 'TIMEOUT');
-    }
+    const check = await isBlockedIp(ip);
+    if (check) return false;
+    const cmd = new Deno.Command("ip", { args: ["route", "add", "blackhole", ip] });
+    const r = await cmd.output();
+    return r.code === 0;
   } catch {
-    locationData.pings.set(popCode, 'TIMEOUT');
+    return false;
   }
 }
 
-async function pingAllLocations() {
-  console.log('');
-  printInfo('Pinging all locations (this may take a moment)...');
-  console.log('');
-
-  const popCodes = Array.from(locationData.names.keys());
-  const total = popCodes.length;
-
-  console.log(`  Starting ${total} ping tests concurrently...`);
-
-  // Ping all locations concurrently
-  await Promise.all(popCodes.map(popCode => pingLocation(popCode)));
-
-  console.log('');
-  printSuccess('Ping test completed');
-}
-
-async function checkLocationBlocked(popCode: string) {
-  const ips = locationData.ips.get(popCode);
-  if (!ips || ips.length === 0) {
-    locationData.blocked.set(popCode, 'UNKNOWN');
-    return;
-  }
-
-  let allBlocked = true;
-
-  for (const ip of ips) {
-    try {
-      const checkRoute = new Deno.Command('ip', {
-        args: ['route', 'show', ip],
-        stdout: 'piped',
-        stderr: 'piped',
-      });
-      const { stdout } = await checkRoute.output();
-      const output = new TextDecoder().decode(stdout);
-      
-      if (!output.includes('blackhole')) {
-        allBlocked = false;
-        break;
-      }
-    } catch {
-      allBlocked = false;
-      break;
-    }
-  }
-
-  locationData.blocked.set(popCode, allBlocked ? 'BLOCKED' : 'UNBLOCKED');
-}
-
-function showLocationsTable() {
-  console.log('');
-  console.log(`${colors.CYAN}╔════════════════════════════════════════════════════════════════════════╗${colors.NC}`);
-  console.log(`${colors.CYAN}║                    CS2 Relay Locations Status                          ║${colors.NC}`);
-  console.log(`${colors.CYAN}╠════╦══════════╦══════════════════════════════╦═══════════╦═════════════╣${colors.NC}`);
-  console.log(`${colors.CYAN}║ #  ║   Code   ║          Location            ║   Ping    ║   Status    ║${colors.NC}`);
-  console.log(`${colors.CYAN}╠════╬══════════╬══════════════════════════════╬═══════════╬═════════════╣${colors.NC}`);
-
-  // Sort by ping value (low to high)
-  const sortedPopCodes = Array.from(locationData.names.keys()).sort((a, b) => {
-    const pingA = locationData.pings.get(a) || 'N/A';
-    const pingB = locationData.pings.get(b) || 'N/A';
-    
-    // Extract numeric values
-    const getNumericPing = (ping: string): number => {
-      if (ping === 'N/A') return Infinity;
-      if (ping === 'TIMEOUT') return Infinity - 1;
-      const match = ping.match(/([\d.]+)ms/);
-      return match ? parseFloat(match[1]) : Infinity;
-    };
-    
-    return getNumericPing(pingA) - getNumericPing(pingB);
-  });
-  let index = 1;
-
-  for (const popCode of sortedPopCodes) {
-    let name = locationData.names.get(popCode) || '';
-    const ping = locationData.pings.get(popCode) || 'N/A';
-    const status = locationData.blocked.get(popCode) || 'UNKNOWN';
-
-    // Truncate name if too long
-    if (name.length > 28) {
-      name = name.substring(0, 25) + '...';
-    }
-
-    // Color code ping
-    let pingColor = colors.NC;
-    if (ping === 'TIMEOUT') {
-      pingColor = colors.RED;
-    } else if (ping.endsWith('ms')) {
-      const pingVal = parseFloat(ping);
-      if (pingVal < 50) {
-        pingColor = colors.GREEN;
-      } else if (pingVal < 100) {
-        pingColor = colors.YELLOW;
-      } else {
-        pingColor = colors.RED;
-      }
-    }
-
-    // Color code status
-    const statusColor = status === 'BLOCKED' ? colors.RED : colors.GREEN;
-
-    console.log(
-      `${colors.CYAN}║${colors.NC} ${index.toString().padStart(2)} ${colors.CYAN}║${colors.NC} ${popCode.padEnd(8)} ${colors.CYAN}║${colors.NC} ${name.padEnd(28)} ${colors.CYAN}║${colors.NC} ${pingColor}${ping.padEnd(9)}${colors.NC} ${colors.CYAN}║${colors.NC} ${statusColor}${status.padEnd(11)}${colors.NC} ${colors.CYAN}║${colors.NC}`
-    );
-    index++;
-  }
-
-  console.log(`${colors.CYAN}╚════╩══════════╩══════════════════════════════╩═══════════╩═════════════╝${colors.NC}`);
-  console.log('');
-}
-
-function getLocationByIndex(index: number): string | null {
-  // Sort by ping value (low to high) - same as showLocationsTable
-  const sortedPopCodes = Array.from(locationData.names.keys()).sort((a, b) => {
-    const pingA = locationData.pings.get(a) || 'N/A';
-    const pingB = locationData.pings.get(b) || 'N/A';
-    
-    // Extract numeric values
-    const getNumericPing = (ping: string): number => {
-      if (ping === 'N/A') return Infinity;
-      if (ping === 'TIMEOUT') return Infinity - 1;
-      const match = ping.match(/([\d.]+)ms/);
-      return match ? parseFloat(match[1]) : Infinity;
-    };
-    
-    return getNumericPing(pingA) - getNumericPing(pingB);
-  });
-  
-  if (index >= 1 && index <= sortedPopCodes.length) {
-    return sortedPopCodes[index - 1];
-  }
-  return null;
-}
-
-async function blockLocation(popCode: string) {
-  const ips = locationData.ips.get(popCode);
-  const name = locationData.names.get(popCode);
-  
-  if (!ips || ips.length === 0) return;
-
-  printInfo(`Blocking location: ${name} (${popCode})`);
-
-  let blockedCount = 0;
-  
-  for (const ip of ips) {
-    // Validate IP before blocking
-    if (!isValidIP(ip)) {
-      printError(`Invalid IP format: ${ip} - skipping`);
-      continue;
-    }
-    
-    if (isPrivateIP(ip)) {
-      printError(`Refusing to block private/localhost IP: ${ip}`);
-      continue;
-    }
-    
-    try {
-      // Check if route blackhole already exists
-      const checkRoute = new Deno.Command('ip', {
-        args: ['route', 'show', ip],
-        stdout: 'piped',
-        stderr: 'piped',
-      });
-      const { stdout } = await checkRoute.output();
-      const output = new TextDecoder().decode(stdout);
-      
-      if (output.includes('blackhole')) {
-        console.log(`  ${ip} - Already blocked`);
-      } else {
-        // Add route blackhole - this prevents ANY routing to this IP at kernel level
-        const blockRoute = new Deno.Command('ip', {
-          args: ['route', 'add', 'blackhole', ip],
-        });
-        const result = await blockRoute.output();
-        
-        if (result.code === 0) {
-          await addToStateFile(ip);
-          console.log(`  ${ip} - Blocked (blackhole route)`);
-          blockedCount++;
-        } else {
-          console.log(`  ${ip} - Failed to block`);
-        }
-      }
-    } catch (error) {
-      printError(`Failed to block ${ip}: ${error}`);
-    }
-  }
-
-  locationData.blocked.set(popCode, 'BLOCKED');
-  printSuccess(`Blocked ${blockedCount} new IPs for ${popCode}`);
-}
-
-async function unblockLocation(popCode: string) {
-  const ips = locationData.ips.get(popCode);
-  const name = locationData.names.get(popCode);
-  
-  if (!ips || ips.length === 0) return;
-
-  printInfo(`Unblocking location: ${name} (${popCode})`);
-
-  let unblockedCount = 0;
-  
-  for (const ip of ips) {
-    // Validate IP before unblocking
-    if (!isValidIP(ip)) {
-      printError(`Invalid IP format: ${ip} - skipping`);
-      continue;
-    }
-    
-    try {
-      // Check if route blackhole exists
-      const checkRoute = new Deno.Command('ip', {
-        args: ['route', 'show', ip],
-        stdout: 'piped',
-        stderr: 'piped',
-      });
-      const { stdout } = await checkRoute.output();
-      const output = new TextDecoder().decode(stdout);
-      
-      if (output.includes('blackhole')) {
-        // Remove blackhole route
-        const unblockRoute = new Deno.Command('ip', {
-          args: ['route', 'del', 'blackhole', ip],
-        });
-        const result = await unblockRoute.output();
-        
-        if (result.code === 0) {
-          await removeFromStateFile(ip);
-          console.log(`  ${ip} - Unblocked`);
-          unblockedCount++;
-        } else {
-          console.log(`  ${ip} - Failed to unblock`);
-        }
-      } else {
-        console.log(`  ${ip} - Not blocked`);
-      }
-    } catch (error) {
-      printError(`Failed to unblock ${ip}: ${error}`);
-    }
-  }
-
-  locationData.blocked.set(popCode, 'UNBLOCKED');
-  printSuccess(`Unblocked ${unblockedCount} IPs for ${popCode}`);
-}
-
-async function showBlockedRoutes() {
-  console.log('');
-  printInfo('CS2 relay routes blocked by this script...');
-  console.log('');
-
+async function unblockIp(ip: string) {
   try {
-    let content: string;
-    try {
-      content = await Deno.readTextFile(STATE_FILE);
-    } catch {
-      console.log('No blocked routes found');
-      return;
-    }
-    
-    const ips = content.split('\n').filter(line => line.trim());
-    
-    if (ips.length === 0) {
-      console.log('No blocked routes found');
-      return;
-    }
-    
-    console.log(`Found ${ips.length} blocked route(s):\n`);
-    
-    for (const ip of ips) {
-      // Verify route still exists
-      const checkRoute = new Deno.Command('ip', {
-        args: ['route', 'show', ip],
-        stdout: 'piped',
-        stderr: 'piped',
-      });
-      const { stdout } = await checkRoute.output();
-      const output = new TextDecoder().decode(stdout);
-      
-      const status = output.includes('blackhole') ? `${colors.RED}BLOCKED${colors.NC}` : `${colors.YELLOW}MISSING${colors.NC}`;
-      console.log(`  ${ip} - ${status}`);
-    }
-  } catch (error) {
-    printError(`Failed to retrieve routes: ${error}`);
+    const check = await isBlockedIp(ip);
+    if (!check) return false;
+    const cmd = new Deno.Command("ip", { args: ["route", "del", "blackhole", ip] });
+    const r = await cmd.output();
+    return r.code === 0;
+  } catch {
+    return false;
   }
 }
 
-async function unblockAll() {
-  console.log('');
-  printInfo('Unblocking all relay locations...');
-
-  for (const popCode of locationData.names.keys()) {
-    await unblockLocation(popCode);
-  }
-
-  printSuccess('All locations unblocked');
-}
-
-async function readLine(prompt: string): Promise<string> {
-  Deno.stdout.writeSync(new TextEncoder().encode(prompt));
+async function readLine(prompt: string) {
+  await Deno.stdout.write(new TextEncoder().encode(prompt));
   const buf = new Uint8Array(1024);
   const n = await Deno.stdin.read(buf);
-  if (n === null) return '';
+  if (n === null) return "";
   return new TextDecoder().decode(buf.subarray(0, n)).trim();
 }
 
-async function blockSelection() {
-  while (true) {
-    console.log('');
-    showLocationsTable();
-    console.log(`${colors.YELLOW}Enter location numbers to BLOCK (comma-separated, e.g., 1,3,5)${colors.NC}`);
-    console.log(`${colors.YELLOW}Or press Enter to return to main menu${colors.NC}`);
-    
-    const selection = await readLine('> ');
-
-    if (!selection) {
-      return;
-    }
-
-    console.log('');
-    const indices = selection.split(',').map(s => s.trim());
-    
-    for (const indexStr of indices) {
-      const index = parseInt(indexStr);
-      if (isNaN(index)) {
-        printError(`Invalid input: ${indexStr}`);
-        continue;
-      }
-
-      const popCode = getLocationByIndex(index);
-      if (popCode) {
-        await blockLocation(popCode);
-        await checkLocationBlocked(popCode);
-      } else {
-        printError(`Invalid index: ${index}`);
-      }
-    }
-
-    console.log('');
-    await readLine('Press Enter to continue...');
-  }
-}
-
-async function unblockSelection() {
-  while (true) {
-    console.log('');
-    showLocationsTable();
-    console.log(`${colors.YELLOW}Enter location numbers to UNBLOCK (comma-separated, e.g., 1,3,5)${colors.NC}`);
-    console.log(`${colors.YELLOW}Or press Enter to return to main menu${colors.NC}`);
-    
-    const selection = await readLine('> ');
-
-    if (!selection) {
-      return;
-    }
-
-    console.log('');
-    const indices = selection.split(',').map(s => s.trim());
-    
-    for (const indexStr of indices) {
-      const index = parseInt(indexStr);
-      if (isNaN(index)) {
-        printError(`Invalid input: ${indexStr}`);
-        continue;
-      }
-
-      const popCode = getLocationByIndex(index);
-      if (popCode) {
-        await unblockLocation(popCode);
-        await checkLocationBlocked(popCode);
-      } else {
-        printError(`Invalid index: ${index}`);
-      }
-    }
-
-    console.log('');
-    await readLine('Press Enter to continue...');
-  }
-}
-
-async function showMenu() {
-  while (true) {
-    console.log('');
-    showLocationsTable();
-    console.log(`${colors.BLUE}═══════════════ Main Menu ═══════════════${colors.NC}`);
-    console.log('1. Ping all locations');
-    console.log('2. Block selection');
-    console.log('3. Unblock selection');
-    console.log('4. Show blocked routes');
-    console.log('5. Unblock all locations');
-    console.log('6. Refresh data and re-ping');
-    console.log('0. Exit');
-    console.log('');
-
-    const choice = await readLine('Select option [0-6]: ');
-
-    switch (choice) {
-      case '1':
-        await pingAllLocations();
-        for (const popCode of locationData.names.keys()) {
-          await checkLocationBlocked(popCode);
-        }
-        break;
-      case '2':
-        await blockSelection();
-        break;
-      case '3':
-        await unblockSelection();
-        break;
-      case '4':
-        await showBlockedRoutes();
-        await readLine('Press Enter to continue...');
-        break;
-      case '5':
-        await unblockAll();
-        for (const popCode of locationData.names.keys()) {
-          await checkLocationBlocked(popCode);
-        }
-        await readLine('Press Enter to continue...');
-        break;
-      case '6':
-        await fetchRelays();
-        await parseLocations();
-        await pingAllLocations();
-        for (const popCode of locationData.names.keys()) {
-          await checkLocationBlocked(popCode);
-        }
-        break;
-      case '0':
-        cleanup();
-        printSuccess('Goodbye!');
-        Deno.exit(0);
-        break;
-      default:
-        printError('Invalid option');
-        break;
-    }
-  }
-}
-
-function cleanup() {
-  try {
-    Deno.removeSync(TEMP_JSON);
-  } catch {
-    // Ignore errors
-  }
-  // Note: We keep STATE_FILE to persist blocked routes across runs
-}
-
-// Main execution
 async function main() {
-  printHeader();
-  await checkDependencies();
-  checkRoot();
-  await fetchRelays();
-  await parseLocations();
-
-  // Initial ping and status check
-  await pingAllLocations();
-
-  // Check current block status for all locations
-  for (const popCode of locationData.names.keys()) {
-    await checkLocationBlocked(popCode);
+  // Require root privileges for `ip route` operations
+  try {
+    if (Deno.uid && Deno.uid() !== 0) {
+      error("Please run as root or with sudo");
+      Deno.exit(1);
+    }
+  } catch {
+    // If uid() isn't available for some reason, continue and let commands fail
+  }
+  try {
+    new Deno.Command("which", { args: ["ping"] }).outputSync();
+  } catch {
+    error("`ping` not found");
+    Deno.exit(1);
+  }
+  try {
+    new Deno.Command("which", { args: ["ip"] }).outputSync();
+  } catch {
+    error("`ip` not found");
+    Deno.exit(1);
   }
 
-  await showMenu();
-}
-
-// Handle cleanup on exit
-globalThis.addEventListener('unload', () => {
-  cleanup();
-});
-
-// Run main function
-if (import.meta.main) {
-  main().then(() => {
-    if (Deno.stdin.isTerminal()) {
-      console.log('');
-      console.log('Press Enter to exit...');
-      const buf = new Uint8Array(1);
-      Deno.stdin.readSync(buf);
+  // Verify `ping` is from iputils (common on Debian/Ubuntu/CentOS/Arch)
+  try {
+    const { stdout, stderr } = await new Deno.Command("ping", { args: ["-V"], stdout: "piped", stderr: "piped" }).output();
+    const out = new TextDecoder().decode(stdout) + new TextDecoder().decode(stderr);
+    if (!/iputils/i.test(out)) {
+      error("`ping` does not appear to be iputils; aborting");
+      Deno.exit(1);
     }
-  }).catch((error) => {
-    printError(`Unexpected error: ${error}`);
-    cleanup();
+  } catch {
+    error("Failed to execute `ping -V` to verify implementation");
     Deno.exit(1);
-  });
+  }
+
+  await fetchRelays();
+  const locs = parseRelays();
+  if (locs.size === 0) {
+    error("No locations found");
+    Deno.exit(1);
+  }
+
+  const pings = await pingAll(locs);
+
+  const blocked = new Map<string, string>();
+  for (const [code, obj] of locs.entries()) {
+    const ip = obj.ips[0];
+    const b = await isBlockedIp(ip);
+    blocked.set(code, b ? "BLOCKED" : "UNBLOCKED");
+  }
+
+  // clear screen
+  console.clear();
+  print("\nCurrent server locations and statuses:");
+  showTable(locs, pings, blocked);
+  while (true) {
+    // horizontal separator
+    print("\n----------------------------------------");
+    print("\nMenu:");
+    print("1) Ping all locations");
+    print("2) Block location (enter code)");
+    print("3) Unblock location (enter code)");
+    print("4) Show blocked routes (state file)");
+    print("5) Unblock all (state file)");
+    print("0) Exit");
+
+    const choice = await readLine("\nSelect: ");
+    if (choice === "0") break;
+
+    if (choice === "1") {
+      // clear screen
+      console.clear();
+      const newPings = await pingAll(locs);
+      for (const [k, v] of newPings) pings.set(k, v);
+      info("Pinged all");
+      showTable(locs, pings, blocked);
+      continue;
+    }
+
+    if (choice === "2") {
+      // clear screen
+      console.clear();
+      // show table
+      showTable(locs, pings, blocked);
+      const code = (await readLine("Enter location code to block: ")).trim();
+      const loc = locs.get(code);
+      const ips = loc?.ips;
+      if (!ips) {
+        error("Unknown code");
+        continue;
+      }
+      for (const ip of ips) {
+        if (!isValidIP(ip) || isPrivateIP(ip)) {
+          error(`Skipping ${ip}`);
+          continue;
+        }
+        const ok = await blockIp(ip);
+        if (ok) {
+          await addState(ip);
+          print(`Blocked ${ip}`);
+        } else print(`Failed ${ip}`);
+      }
+      blocked.set(code, "BLOCKED");
+      showTable(locs, pings, blocked);
+      continue;
+    }
+
+    if (choice === "3") {
+      // clear screen
+      console.clear();
+      // show table
+      showTable(locs, pings, blocked);
+      const code = (await readLine("Enter location code to unblock: ")).trim();
+      const loc = locs.get(code);
+      const ips = loc?.ips;
+      if (!ips) {
+        error("Unknown code");
+        continue;
+      }
+      for (const ip of ips) {
+        if (!isValidIP(ip)) {
+          error(`Skipping ${ip}`);
+          continue;
+        }
+        const ok = await unblockIp(ip);
+        if (ok) {
+          await removeState(ip);
+          print(`Unblocked ${ip}`);
+        } else print(`Not blocked ${ip}`);
+      }
+      blocked.set(code, "UNBLOCKED");
+      continue;
+    }
+
+    if (choice === "4") {
+      // clear screen
+      console.clear();
+      const ips = await readState();
+      if (ips.length === 0) {
+        print("No blocked routes recorded");
+        continue;
+      }
+      print(`Recorded ${ips.length} IP(s):`);
+      for (const ip of ips) {
+        const b = await isBlockedIp(ip);
+        print(`  ${ip} - ${b ? "BLOCKED" : "MISSING"}`);
+      }
+      continue;
+    }
+
+    if (choice === "5") {
+      // clear screen
+      console.clear();
+      // show table
+      showTable(locs, pings, blocked);
+      const ips = await readState();
+      if (ips.length === 0) {
+        print("No blocked routes recorded");
+        continue;
+      }
+      // Filter valid IPs, then unblock in parallel
+      const valid = ips.filter(isValidIP);
+      const results = await Promise.all(valid.map(async (ip) => ({ ip, ok: await unblockIp(ip) })));
+      let unblocked = 0;
+      for (const r of results) {
+        if (r.ok) {
+          unblocked++;
+          print(`Unblocked ${r.ip}`);
+        } else print(`Failed ${r.ip}`);
+      }
+      // Remaining IPs are those that either were invalid or failed to unblock
+      const remaining = ips.filter((ip) => !results.some((r) => r.ip === ip && r.ok));
+      await writeState(remaining);
+      success(`Unblocked ${unblocked} IP(s)`);
+      // Refresh blocked map for first IPs
+      await Promise.all(
+        Array.from(locs.entries()).map(async ([code, obj]) => {
+          const b = await isBlockedIp(obj.ips[0]);
+          blocked.set(code, b ? "BLOCKED" : "UNBLOCKED");
+        }),
+      );
+      continue;
+    }
+
+    print("Unknown option");
+  }
+
+  success("Goodbye");
 }
+
+if (import.meta.main) main();

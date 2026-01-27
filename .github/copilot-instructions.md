@@ -1,93 +1,44 @@
-# CS2 Server Picker - AI Agent Instructions
+# Copilot instructions — cs2-server-picker-linux
 
-## Project Overview
-Tool to block CS2 relay servers by location using **kernel-level IP route blackholes**, not iptables. Critical distinction: iptables doesn't work because CS2 runs in Steam's pressure-vessel container which bypasses OUTPUT chain rules. Blackholes operate at the kernel routing layer before network namespaces.
+Purpose
+- Short: single-file Deno tool to fetch CS2 relay servers by location and optionally block them via kernel "blackhole" routes.
 
-## Architecture & Key Files
-- **main.ts**: Interactive CLI for blocking/unblocking CS2 relay IPs (~800 lines)
-  - Includes "Unblock all" functionality (menu option 5) to remove all blocks
-- **State file**: `/var/lib/cs2-blocker/blocked_ips.txt` (mode 0o600, dir mode 0o700)
-- **API**: `https://api.steampowered.com/ISteamApps/GetSDRConfig/v1?appid=730`
+Big picture
+- Single entry: [main.ts](main.ts). The script fetches Steam SDR config, writes it to `/tmp/cs2_relays.json`, parses `data.pops` to build a Map<code, ips[]>, pings the first IP per location, and exposes an interactive menu to block/unblock by location code.
+- Blocking mechanism: `ip route add blackhole <ip>` / `ip route del blackhole <ip>` (kernel-level, system `ip` command). Blocked IPs are persisted to `/var/lib/cs2-blocker/blocked_ips.txt`.
 
-## Critical Technical Decisions
+Key files
+- [main.ts](main.ts): entire program and the authoritative place for behavior and constants (API_URL, TEMP_JSON, STATE_DIR, STATE_FILE).
+- [deno.json](deno.json): defined `tasks` (build, build-linux, start) and formatting settings. Use these for consistent builds.
 
-### Why Blackholes, Not Iptables
-- CS2 runs in containerized environment (Steam pressure-vessel)
-- Iptables OUTPUT chain rules show 0 packet counters → traffic bypasses them
-- IP route blackholes: `ip route add blackhole <ip>` works at kernel level BEFORE containers
-- Blocks ALL protocols (TCP, UDP, ICMP) with one command
+Runtime & permissions
+- This tool requires root for route changes. The script checks `Deno.uid()` and will exit if not root when needed.
+- Required system binaries: `ping` (iputils expected) and `ip` (iproute2). The script validates `ping -V` contains "iputils".
+- Deno permissions: `--allow-net --allow-run --allow-read --allow-write --allow-sys` (see `deno.json` tasks).
 
-### State Management Pattern
-Since blackhole routes have no comment system (unlike iptables), use dedicated state file at `/var/lib/cs2-blocker/blocked_ips.txt` to track script-managed routes. This distinguishes our routes from user-created ones and survives reboots (don't use `/tmp`).
+Developer workflows
+- Build a native binary (Linux x86_64): `deno task build-linux` (uses the `build-linux` task in [deno.json](deno.json)).
+- Build generic executable: `deno task build`.
+- Run interactively (recommended via sudo):
+  - `sudo deno run --allow-net --allow-run --allow-read --allow-write --allow-sys main.ts`
+  - or use the `start` task defined in `deno.json`.
+- Quick checks before running: `which ping` and `which ip`. If blocking code is being changed, test non-blocking flows first (fetch/parse/ping) without root.
 
-## Security Patterns (DO NOT SKIP)
-Always validate IPs before blocking/unblocking:
+Project-specific conventions & patterns
+- Minimal, single-file implementation. New features should preserve the simple structure unless adding substantial functionality.
+- State persistence: use `STATE_DIR` and `STATE_FILE` constants in `main.ts`. The code expects one IP per line in the state file.
+- Location handling: the tool only pings and shows the first IP for each location code; blocking/unblocking acts on all reported IPs for a code but status/summary is based on the first IP.
+- IP filtering: uses `isValidIP()` and `isPrivateIP()` helper functions — private/local addresses are explicitly skipped.
+- External commands invoked with `Deno.Command`/`output()` and `outputSync()`; return codes are used to decide success.
 
-```typescript
-// IP validation regex - IPv4 only
-const ipv4Regex = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+Editing guidance for AI agents
+- Prefer small, focused edits to `main.ts`. If you change behavior that affects persisted state or the system commands, update constants at the top (`TEMP_JSON`, `STATE_DIR`, `STATE_FILE`) and adjust permission hints in `deno.json`.
+- When adding tests or automation, avoid running `blockIp`/`unblockIp` in CI; instead mock `Deno.Command` or isolate routes to a test namespace.
+- If introducing dependencies, prefer standard Deno std modules and document added permissions in `deno.json` tasks.
 
-// Private/localhost ranges to REFUSE blocking
-- 127.0.0.0/8 (localhost)
-- 10.0.0.0/8 (private)
-- 172.16.0.0/12 (private)
-- 192.168.0.0/16 (private)
-- 169.254.0.0/16 (link-local)
-```
+Examples (use as direct references)
+- Where parsing occurs: see `parseRelays()` in [main.ts](main.ts).
+- Where block state is stored: `STATE_FILE` constant at top of [main.ts](main.ts).
+- How pinging is done: `pingAll()` calls `ping()` which runs `ping -c 2 -W 1 <ip>` and parses output for average latency.
 
-Apply validation in: `parseLocations()`, `blockLocation()`, `unblockLocation()`, and unblock all functionality.
-
-## Key Commands
-```bash
-# Block IP (kernel blackhole)
-ip route add blackhole <ip>
-
-# Check if blocked
-ip route show <ip>  # Output contains "blackhole" if blocked
-
-# Unblock
-ip route del blackhole <ip>
-
-# Run main script
-sudo deno run --allow-net --allow-run --allow-read --allow-write=/var/lib/cs2-blocker main.ts
-
-# Or use compiled version
-sudo ./cs2-blocker
-```
-
-## Data Flow
-1. Fetch relay data from Steam API → `/tmp/cs2_relays.json`
-2. Parse `pops` object, extract IPv4 from `relays[]` array
-3. Validate IPs (skip private ranges from API)
-4. Concurrent ping all locations with `Promise.all()`
-5. Sort display by ping (low to high)
-6. Block: `ip route add blackhole <ip>` + add to state file
-7. Unblock: `ip route del blackhole <ip>` + remove from state file
-
-## Conventions
-- **Colors**: Use existing `colors` object for consistent terminal output
-- **Permissions**: State dir 0o700, state file 0o600
-- **Ping display**: Integer values only (`Math.round()`)
-- **Location sorting**: By ping value (low to high) in both display and selection
-- **Index selection**: 1-based (match displayed table numbers)
-- **Error handling**: Always validate IPs, catch all `Deno.Command` errors
-
-## Important Gotchas
-- **Steam API parsing**: Check `data.pops[popCode].relays` is array before iterating
-- **Container bypass**: Never suggest iptables for this use case - blackholes only
-- **State file location**: `/var/lib/` not `/tmp/` (survives reboot)
-- **Menu option 4**: Shows blocked routes (state file), not all iptables rules
-- **Relay routing**: CS2 may route through alternate relays even when one is blocked (e.g., Dubai → Mumbai fallback). Acknowledge this limitation in docs.
-
-## Testing Workflow
-1. Run as non-root → should fail with "run as root or with sudo"
-2. Block location → verify `ip route show <ip>` contains "blackhole"
-3. Check state file → should contain blocked IP
-4. Unblock → verify route removed and IP removed from state file
-5. Use option 5 (Unblock all) → should remove all routes tracked in state file
-
-## Debugging
-- Check iptables packet counters: If 0, iptables isn't seeing traffic (containerization issue)
-- Test blackhole: `ping <blocked-ip>` should show "Network is unreachable"
-- State file missing: Script creates it automatically on first block
-- Permission denied: Need sudo for `ip route` commands
+If anything in these notes is unclear or you'd like more detail (examples of test mocks, alternate unblock strategies, or a small refactor plan), tell me which part to expand.
