@@ -4,7 +4,7 @@ Small Deno tool to fetch CS2/Steam relay POPs, show ping/status, and optionally 
 
 Quick start
 
-- Recommended: download the prebuilt binary for your platform from the Releases page:
+- Recommended: download the prebuilt binary from the Releases page:
 
 	Visit https://github.com/MRsabs/cs2-server-picker-linux/releases and download `cs2-server-picker-linux`.
 
